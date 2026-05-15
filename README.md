@@ -1,85 +1,234 @@
-# AP2 — Assignment 3: Message Queue & Database Migrations
+# AP2 — Assignment 4: Caching & Background Jobs
 
-**Student:** Eskender Rymabev
+**Student:** Eskender Rymbaev
 
 ---
 
 ## 1. Project Overview
 
-This assignment extends the Medical Scheduling Platform built in Assignment 2 in two directions:
+This assignment extends the Medical Scheduling Platform from Assignment 3 with two production-readiness concerns:
 
-1. **PostgreSQL persistence** — both existing services replace their in-memory maps with a real PostgreSQL database. Schema is managed exclusively through `golang-migrate` versioned migration files.
-2. **Asynchronous event-driven communication via NATS** — every successful write operation publishes a domain event. A new third service, the **Notification Service**, subscribes to all events and prints a structured JSON log line to stdout.
+1. **Redis Caching** — both Doctor Service and Appointment Service get a Redis-backed cache layer that reduces database load and improves read latency. Cache is hidden behind a `CacheRepository` interface — no Redis imports in domain or use-case code.
+2. **Background Jobs & External Integration** — the Notification Service gets a worker-pool-based job queue. When an appointment transitions to `done`, a background job calls a simulated external Mock Notification Gateway over HTTP with retry logic and idempotency.
 
-### What changed compared to Assignment 2
+### What changed compared to Assignment 3
 
-| Layer | Assignment 2 | Assignment 3 |
+| Layer | Assignment 3 | Assignment 4 |
 |---|---|---|
-| Repository | In-memory maps | PostgreSQL via `database/sql` + `pgx/v5` |
-| Schema management | None | `golang-migrate` migration files |
-| Inter-service async | None | NATS Core Pub/Sub |
-| Services | Doctor + Appointment | Doctor + Appointment + **Notification** |
+| Read path | Always hits PostgreSQL | Cache-Aside: Redis first, DB on miss |
+| Write path | DB only | Write-Through / Write-Around + cache invalidation |
+| Rate limiting | None | Redis sliding-window per client IP as gRPC interceptor |
+| Notification Service | Logs events to stdout | Logs + background job queue + gateway calls |
+| Services | Doctor + Appointment + Notification | + **Mock Gateway** (4th binary) |
 
-Everything that must NOT change (domain models, use-case logic, gRPC contracts, Clean Architecture layering) is identical to Assignment 2.
+Everything that must NOT change (domain models, use-case logic, gRPC contracts, PostgreSQL schemas, NATS integration) is identical to Assignment 3.
 
 ---
 
-## 2. Broker Choice — NATS (Core)
+## 2. Cache Strategy
 
-**Chosen broker: NATS (Core)**
+### Doctor Service
 
-**Reason:** NATS Core perfectly fits our use case of stateless, fire-and-forget notifications. It requires zero configuration beyond starting the server binary (or a single Docker container), has no message persistence overhead, and its Go client (`nats.go`) is idiomatic and lightweight. Since the Notification Service only needs to log events and does not need guaranteed delivery or replay, the simplicity of NATS Core is the right trade-off here.
+| Operation | Strategy | Redis Key | TTL |
+|---|---|---|---|
+| `GetDoctor` | Cache-Aside | `doctor:<id>` | `CACHE_TTL_SECONDS` |
+| `ListDoctors` | Cache-Aside | `doctors:list` | `CACHE_TTL_SECONDS` |
+| `CreateDoctor` | Write-Through — cache new doctor, invalidate list | `doctor:<id>`, `doctors:list` | immediate eviction for list |
 
-### NATS vs RabbitMQ — two concrete differences
+### Appointment Service
 
-| | NATS (Core) | RabbitMQ |
-|---|---|---|
-| **Persistence** | None — messages are fire-and-forget; if no subscriber is connected at publish time, the message is lost | Queue-level durability; messages survive broker restart and are held until a consumer acknowledges them |
-| **Delivery model** | Pure Pub/Sub; every active subscriber on a subject receives every message | Flexible routing via exchanges (fanout, topic, direct); point-to-point queues give each message to exactly one consumer |
+| Operation | Strategy | Redis Key | TTL |
+|---|---|---|---|
+| `GetAppointment` | Cache-Aside | `appointment:<id>` | `CACHE_TTL_SECONDS` |
+| `ListAppointments` | Cache-Aside | `appointments:list` | `CACHE_TTL_SECONDS` |
+| `CreateAppointment` | Write-Around — invalidate list only | `appointments:list` | immediate eviction |
+| `UpdateAppointmentStatus` | Write-Through — update cache + invalidate list | `appointment:<id>`, `appointments:list` | immediate eviction for list |
 
-**When to choose RabbitMQ:** when guaranteed at-least-once delivery is required (e.g., sending an email confirmation, billing events) or when messages must survive broker restarts. NATS JetStream is the equivalent durable option within the NATS ecosystem.
+### Why Write-Around for CreateAppointment?
+New appointments are rarely read immediately after creation. Write-Around avoids polluting the cache with data that may not be accessed. The individual key `appointment:<id>` is populated lazily on first `GetAppointment`.
+
+### Why Write-Through for UpdateAppointmentStatus?
+Status is a frequently-read field. Write-Through ensures the cache is immediately consistent after an update — no stale reads for the TTL window.
+
+### Cache Invalidation Rules
+- Invalidation happens **after** the DB write succeeds and **before** the gRPC response is returned.
+- A cache miss **never** returns an error — falls through to DB transparently.
+- A cache write failure is **logged** but does not block the gRPC response (best-effort).
+
+### Stale-read window
+Between a write and the TTL expiry, a stale value could be read if invalidation fails silently. The window is bounded by `CACHE_TTL_SECONDS` (default 60s).
 
 ---
 
-## 3. Architecture Diagram
+## 3. Rate Limiting Algorithm — Sliding Window Counter
+
+**Algorithm: Sliding Window Counter using Redis Sorted Set (ZSET)**
+
+**How it works:**
+1. Every request adds the current timestamp (nanoseconds) as a new member in a ZSET keyed by `rate_limit:<clientIP>`
+2. `ZREMRANGEBYSCORE` removes members older than `now - 60s` (outside the window)
+3. `ZCARD` counts remaining members = requests in the last 60 seconds
+4. If count exceeds `RATE_LIMIT_RPM` → return `codes.ResourceExhausted`
+5. `EXPIRE` resets the key TTL to 61 seconds
+
+**Why ZSET and not INCR+TTL (fixed window)?**
+A fixed window counts per minute boundary (e.g. 12:00–12:01). A client could send 100 requests at 12:00:59 and 100 more at 12:01:01 — 200 requests in 2 seconds, both windows happy. Sliding window counts the last 60 seconds regardless of clock boundaries.
+
+**Implementation:** gRPC `UnaryServerInterceptor` — zero changes to handler code.
+
+**Redis data structure:** `ZSET` — key `rate_limit:<clientIP>`, score = nanosecond timestamp, member = nanosecond timestamp string.
+
+### Rate Limiting Trade-offs (per-instance vs centralised)
+
+| Problem | Per-instance | Centralised Redis |
+|---|---|---|
+| Horizontal scaling | Each instance has its own counter → 3 instances × 100 RPM = 300 RPM effective limit | Single Redis counter shared by all instances → true 100 RPM globally |
+| Clock skew | Each instance uses its own clock | Redis server clock is the single source of truth |
+
+Our implementation uses **centralised Redis** — all instances share the same ZSET key per client IP.
+
+---
+
+## 4. Background Job Queue Design
+
+### Worker Pool Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                    Medical Scheduling Platform                    │
-│                                                                  │
-│  ┌─────────────────────┐     gRPC      ┌──────────────────────┐ │
-│  │   Doctor Service    │◄──────────────│ Appointment Service  │ │
-│  │   :50051            │               │ :50052               │ │
-│  │                     │               │                      │ │
-│  │  ┌───────────────┐  │               │  ┌────────────────┐  │ │
-│  │  │  PostgreSQL   │  │               │  │  PostgreSQL    │  │ │
-│  │  │  (doctors DB) │  │               │  │ (appointments) │  │ │
-│  │  └───────────────┘  │               │  └────────────────┘  │ │
-│  │                     │               │                      │ │
-│  │  Publishes:         │               │  Publishes:          │ │
-│  │  doctors.created ───┼──────────┐    │  appointments.───────┼─┤
-│  └─────────────────────┘          │    │  created             │ │
-│                                   │    │  appointments.───────┼─┤
-│                                   │    │  status_updated      │ │
-│                                   ▼    └──────────────────────┘ │
-│                           ┌───────────────┐         │           │
-│                           │  NATS Server  │◄────────┘           │
-│                           │  :4222        │                     │
-│                           └───────┬───────┘                     │
-│                                   │                             │
-│                                   ▼                             │
-│                    ┌──────────────────────────┐                 │
-│                    │   Notification Service   │                 │
-│                    │   (subscriber, no port)  │                 │
-│                    │                          │                 │
-│                    │  Logs JSON to stdout     │                 │
-│                    └──────────────────────────┘                 │
-└──────────────────────────────────────────────────────────────────┘
+NATS message → subscriber.handleMessage()
+                    │
+                    ▼
+              pool.Submit(job)
+                    │
+                    ▼
+         jobsChan (buffered, cap=100)
+                    │
+         ┌──────────┼──────────┐
+         ▼          ▼          ▼
+      worker(0)  worker(1)  worker(2)   ← goroutines, count = WORKER_POOL_SIZE
+         │
+         ▼
+    processJob(job)
+         │
+    ┌────┴─────────────────┐
+    │  idempotency check   │ → Redis EXISTS
+    │  POST /notify        │ → Mock Gateway
+    │  retry + backoff     │
+    │  dead-letter         │ → stderr
+    └──────────────────────┘
+```
+
+- **Channel capacity:** 100 buffered slots. If all workers are busy and the buffer is full, `Submit()` uses a `select` with `ctx.Done()` to avoid blocking forever.
+- **Backpressure:** If channel is full, the job is dropped with a warning log. In production this would trigger an alert.
+- **Graceful shutdown:** `Stop()` calls `cancel()` (signals workers via context), then `wg.Wait()` (waits for all goroutines to finish), then `close(jobsChan)`.
+
+### Job Lifecycle
+
+```
+1. Event received from NATS (appointments.status_updated, new_status=done)
+2. Job created and submitted to channel
+3. Worker picks up job
+4. Idempotency check: Redis EXISTS idempotency:<sha256>
+   → exists: log "duplicate dropped", return
+5. Log: status="enqueued"
+6. Attempt 1: POST /notify
+   → 200: Redis SET idempotency key (TTL 24h), log status="success"
+   → 503: log status="retry", sleep 1s, attempt 2
+7. Attempt 2: POST /notify
+   → 200: success
+   → 503: log status="retry", sleep 2s, attempt 3
+8. Attempt 3: POST /notify
+   → 200: success
+   → 503: log status="retry", sleep 4s → write dead_letter to stderr, drop job
 ```
 
 ---
 
-## 4. Environment Variables
+## 5. Idempotency
+
+**Key derivation:**
+```go
+input := fmt.Sprintf("%s:%s:%s", eventType, id, timestamp.UTC().Format(time.RFC3339Nano))
+hash  := sha256.Sum256([]byte(input))
+key   := fmt.Sprintf("idempotency:%x", hash[:])
+```
+
+**Storage:** Redis string, value `"done"`, TTL 24 hours (86400 seconds).
+
+**Why SHA-256?** The key must be deterministic (same event → same key) and compact. SHA-256 of `eventType + appointmentID + timestamp` is unique per event occurrence.
+
+**Why 24h TTL?** Long enough to survive a service restart and prevent reprocessing of recently delivered events. After 24h the key expires and a theoretically replayed event would be reprocessed — acceptable for notifications.
+
+**How it prevents duplicates on retry:** Before calling the gateway, the worker checks `EXISTS idempotency:<key>`. If found, the job is silently dropped. If the worker crashes mid-flight and the key was not yet set, the job will be reprocessed on restart — that's intentional (at-least-once delivery).
+
+---
+
+## 6. Dead-Letter Strategy
+
+After 3 failed attempts, the worker writes a structured JSON entry to **stderr**:
+
+```json
+{
+  "time": "2026-05-01T10:25:10Z",
+  "level": "error",
+  "job_id": "idempotency:abc123...",
+  "attempt": 3,
+  "status": "dead_letter",
+  "error": "service unavailable"
+}
+```
+
+**The worker does not crash** — it continues processing the next job from the channel.
+
+**How to inspect dead-letter entries:**
+```bash
+# Redirect stderr to a file when starting the service
+go run ./cmd/notification-service 2> dead_letters.log
+
+# Then inspect
+cat dead_letters.log
+```
+
+**What a production system would do:**
+- Publish dead-letter events to a dedicated broker subject (e.g. `appointments.notifications.dead_letter`) so ops teams can replay them
+- Set up alerting (PagerDuty, Grafana) when dead-letter count exceeds a threshold
+- Store dead-letter payloads in a database table for manual inspection and replay
+
+---
+
+## 7. Mock Notification Gateway
+
+A minimal fourth Go binary that simulates an idempotent external notification API.
+
+**Endpoint:** `POST /notify`
+
+```json
+// Request
+{ "idempotency_key": "...", "channel": "email", "recipient": "patient@clinic.kz", "message": "..." }
+
+// Response — new key
+{ "status": "accepted" }
+
+// Response — duplicate key
+{ "status": "duplicate" }
+
+// Response — 20% of the time (transient failure simulation)
+HTTP 503 { "error": "service unavailable" }
+```
+
+**Idempotency:** tracked in-memory via `map[string]struct{}` + `sync.Mutex`. Restarting the gateway clears the map (intentional for the demo — Redis-backed in production).
+
+**20% failure rate:** `rand.Intn(100) < 20` — exercises retry logic during defense.
+
+---
+
+## 8. Environment Variables
+
+### All Services
+
+| Variable | Default | Description |
+|---|---|---|
+| `REDIS_URL` | `redis://localhost:6379` | Redis connection string |
+| `CACHE_TTL_SECONDS` | `60` | Cache entry TTL in seconds |
 
 ### Doctor Service
 
@@ -88,6 +237,7 @@ Everything that must NOT change (domain models, use-case logic, gRPC contracts, 
 | `DATABASE_URL` | `postgres://postgres:postgres@localhost:5432/doctors?sslmode=disable` | PostgreSQL DSN |
 | `NATS_URL` | `nats://localhost:4222` | NATS server URL |
 | `GRPC_ADDR` | `:50051` | gRPC listen address |
+| `RATE_LIMIT_RPM` | `100` | Max requests per minute per client IP |
 
 ### Appointment Service
 
@@ -97,312 +247,330 @@ Everything that must NOT change (domain models, use-case logic, gRPC contracts, 
 | `NATS_URL` | `nats://localhost:4222` | NATS server URL |
 | `GRPC_ADDR` | `:50052` | gRPC listen address |
 | `DOCTOR_SERVICE_ADDR` | `localhost:50051` | Doctor Service gRPC address |
+| `RATE_LIMIT_RPM` | `100` | Max requests per minute per client IP |
 
 ### Notification Service
 
 | Variable | Default | Description |
 |---|---|---|
 | `NATS_URL` | `nats://localhost:4222` | NATS server URL |
+| `REDIS_URL` | `redis://localhost:6379` | Redis (idempotency store) |
+| `GATEWAY_URL` | `http://localhost:8080` | Mock Gateway URL |
+| `WORKER_POOL_SIZE` | `3` | Number of background job workers |
+
+### Mock Gateway
+
+| Variable | Default | Description |
+|---|---|---|
+| `GATEWAY_PORT` | `8080` | HTTP listen port |
 
 ---
 
-## 5. Infrastructure Setup
+## 9. Infrastructure Setup
 
-### Start PostgreSQL
+### Docker Compose (recommended)
 
 ```bash
-# Create two separate databases — one per service
-docker run -d --name pg \
-  -e POSTGRES_PASSWORD=postgres \
-  -p 5432:5432 \
-  postgres:16-alpine
+# Start PostgreSQL, Redis, NATS all at once
+docker-compose up -d
 
-# Wait a few seconds, then create the databases
+# Check all are healthy
+docker-compose ps
+```
+
+### Manual Docker commands
+
+```bash
+# PostgreSQL
+docker run -d --name pg -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:16-alpine
 docker exec -it pg psql -U postgres -c "CREATE DATABASE doctors;"
 docker exec -it pg psql -U postgres -c "CREATE DATABASE appointments;"
-```
 
-### Start NATS
+# Redis
+docker run -d --name redis -p 6379:6379 redis:7-alpine
 
-```bash
-docker run -d --name nats \
-  -p 4222:4222 \
-  nats:latest
-```
-
----
-
-## 6. First-Time Dependency Setup
-
-Run once from the project root (requires internet access):
-
-```bash
-chmod +x setup.sh
-./setup.sh
-```
-
-This runs `go mod tidy` in each service directory to download and verify all modules.
-
----
-
-## 7. Migration Instructions
-
-Migrations run **automatically on service startup** (before the gRPC server accepts requests). No manual steps are needed in normal operation.
-
-### Manual apply / rollback (using golang-migrate CLI)
-
-```bash
-# Install the CLI
-go install -tags 'postgres' github.com/golang-migrate/migrate/v4/cmd/migrate@latest
-
-# Apply all up-migrations for Doctor Service
-migrate -path doctor-service/migrations \
-        -database "postgres://postgres:postgres@localhost:5432/doctors?sslmode=disable" \
-        up
-
-# Roll back one step (tested during defense)
-migrate -path doctor-service/migrations \
-        -database "postgres://postgres:postgres@localhost:5432/doctors?sslmode=disable" \
-        down 1
-
-# Same for Appointment Service
-migrate -path appointment-service/migrations \
-        -database "postgres://postgres:postgres@localhost:5432/appointments?sslmode=disable" \
-        up
-
-migrate -path appointment-service/migrations \
-        -database "postgres://postgres:postgres@localhost:5432/appointments?sslmode=disable" \
-        down 1
+# NATS
+docker run -d --name nats -p 4222:4222 nats:latest
 ```
 
 ---
 
-## 8. Service Startup Order
+## 10. Service Startup Order
 
-Start in this order (each in its own terminal):
+Start in this exact order (each in its own terminal):
 
 ```bash
-# Terminal 1 — infrastructure (if not already running)
-docker start pg nats
+# Terminal 1 — Mock Gateway (start first so Notification Service can reach it)
+cd mock-gateway
+GATEWAY_PORT=8080 go run ./cmd
 
-# Terminal 2 — Doctor Service (must start before Appointment Service)
+# Terminal 2 — Doctor Service
 cd doctor-service
 DATABASE_URL="postgres://postgres:postgres@localhost:5432/doctors?sslmode=disable" \
 NATS_URL="nats://localhost:4222" \
+REDIS_URL="redis://localhost:6379" \
+GRPC_ADDR=":50051" \
+CACHE_TTL_SECONDS=60 \
+RATE_LIMIT_RPM=100 \
 go run ./cmd/doctor-service
 
 # Terminal 3 — Appointment Service
 cd appointment-service
 DATABASE_URL="postgres://postgres:postgres@localhost:5432/appointments?sslmode=disable" \
 NATS_URL="nats://localhost:4222" \
+REDIS_URL="redis://localhost:6379" \
+GRPC_ADDR=":50052" \
 DOCTOR_SERVICE_ADDR="localhost:50051" \
+CACHE_TTL_SECONDS=60 \
+RATE_LIMIT_RPM=100 \
 go run ./cmd/appointment-service
 
 # Terminal 4 — Notification Service
 cd notification-service
 NATS_URL="nats://localhost:4222" \
+REDIS_URL="redis://localhost:6379" \
+GATEWAY_URL="http://localhost:8080" \
+WORKER_POOL_SIZE=3 \
 go run ./cmd/notification-service
 ```
 
-**Why this order:** The Appointment Service dials the Doctor Service gRPC endpoint at startup, so the Doctor Service must be reachable first. NATS must be running before the Notification Service starts (it retries with backoff).
-
----
-
-## 9. Event Contract
-
-| Subject | Publisher | Trigger | JSON Fields |
-|---|---|---|---|
-| `doctors.created` | Doctor Service | `CreateDoctor` succeeds | `event_type`, `occurred_at`, `id`, `full_name`, `specialization`, `email` |
-| `appointments.created` | Appointment Service | `CreateAppointment` succeeds | `event_type`, `occurred_at`, `id`, `title`, `doctor_id`, `status` |
-| `appointments.status_updated` | Appointment Service | `UpdateAppointmentStatus` succeeds | `event_type`, `occurred_at`, `id`, `old_status`, `new_status` |
-
-### Example payloads
-
-```json
-// doctors.created
-{
-  "event_type": "doctors.created",
-  "occurred_at": "2026-05-01T10:23:44Z",
-  "id": "d1a2b3c4-...",
-  "full_name": "Dr. Aisha Seitkali",
-  "specialization": "Cardiology",
-  "email": "a.seitkali@clinic.kz"
-}
-
-// appointments.created
-{
-  "event_type": "appointments.created",
-  "occurred_at": "2026-05-01T10:24:01Z",
-  "id": "e5f6g7h8-...",
-  "title": "Initial cardiac consultation",
-  "doctor_id": "d1a2b3c4-...",
-  "status": "new"
-}
-
-// appointments.status_updated
-{
-  "event_type": "appointments.status_updated",
-  "occurred_at": "2026-05-01T10:25:10Z",
-  "id": "e5f6g7h8-...",
-  "old_status": "new",
-  "new_status": "in_progress"
-}
+**Windows PowerShell** — set env vars separately:
+```powershell
+$env:DATABASE_URL="postgres://postgres:postgres@localhost:5432/doctors?sslmode=disable"
+$env:NATS_URL="nats://localhost:4222"
+$env:REDIS_URL="redis://localhost:6379"
+$env:GRPC_ADDR=":50051"
+$env:CACHE_TTL_SECONDS="60"
+$env:RATE_LIMIT_RPM="100"
+go run ./cmd/doctor-service
 ```
 
 ---
 
-## 10. Notification Service
+## 11. Cache Consistency Trade-offs
 
-The Notification Service is a pure subscriber — it has no gRPC server, no HTTP server, and no database. On startup it connects to NATS and subscribes to all three subjects. If NATS is unavailable it retries with exponential backoff (1 s → 2 s → 4 s → … up to 6 attempts) then exits with a non-zero code.
+### Redis unavailable
+If Redis is unreachable at startup, the service logs a warning and continues with a no-op cache (`client = nil`). All cache methods return immediately without error. The service serves all requests from PostgreSQL — caching is a pure performance optimisation, never a single point of failure.
 
-Each received message is deserialized from JSON and printed as a single JSON line to stdout:
+### Which reads become eventually consistent
+After a write, the list cache (`doctors:list`, `appointments:list`) is immediately invalidated. Individual entity keys (`doctor:<id>`, `appointment:<id>`) are updated via Write-Through on the same request. There is no eventual consistency window for entities — only a bounded staleness window equal to `CACHE_TTL_SECONDS` if invalidation silently fails.
 
-```json
-{"time":"2026-05-01T10:23:44Z","subject":"doctors.created","event":{"event_type":"doctors.created","occurred_at":"2026-05-01T10:23:44Z","id":"doc-1","full_name":"Dr. Aisha Seitkali","specialization":"Cardiology","email":"a.seitkali@clinic.kz"}}
-```
-
-On `SIGTERM` / `SIGINT` it drains in-flight messages, closes the NATS connection, and exits with code 0.
+### Distributed cache (Redis Cluster) trade-offs
+| Concern | Single Redis | Redis Cluster |
+|---|---|---|
+| Key invalidation | Atomic `DEL` | Key must hash to the same slot; cross-slot transactions require `{}` hash tags |
+| Consistency | Strong (single node) | Strong within a slot; cross-slot operations are not atomic |
+| Availability | Single point of failure | Automatic failover via cluster bus |
 
 ---
 
-## 11. grpcurl Commands & Expected Notification Service Output
+## 12. grpcurl Commands & Expected Output
 
-### Create a Doctor
+### Checkpoint 1 — Cache Hit
 
 ```bash
+# Open Redis MONITOR in a separate terminal first
+docker exec -it <redis_container_id> redis-cli MONITOR
+
+# Create a doctor
 grpcurl -plaintext -d '{
   "full_name": "Dr. Aisha Seitkali",
   "specialization": "Cardiology",
   "email": "a.seitkali@clinic.kz"
 }' localhost:50051 doctor.DoctorService/CreateDoctor
+
+# First call — MISS → DB → SET in Redis
+grpcurl -plaintext -d '{"id": "<id>"}' localhost:50051 doctor.DoctorService/GetDoctor
+
+# Second call — HIT from Redis, no DB query
+grpcurl -plaintext -d '{"id": "<id>"}' localhost:50051 doctor.DoctorService/GetDoctor
 ```
 
-**Expected Notification Service stdout:**
-```json
-{"time":"<RFC3339>","subject":"doctors.created","event":{"email":"a.seitkali@clinic.kz","event_type":"doctors.created","full_name":"Dr. Aisha Seitkali","id":"<uuid>","occurred_at":"<RFC3339>","specialization":"Cardiology"}}
+**Doctor Service terminal:**
+```
+[DEBUG] Cache SET: doctor:<id> (TTL=60s)   ← first call
+[DEBUG] Cache HIT: doctor:<id>             ← second call
 ```
 
 ---
 
-### Create an Appointment
+### Checkpoint 2 — Rate Limiter
 
 ```bash
+# Send 110 requests — after 100 you'll get ResourceExhausted
+for i in $(seq 1 110); do
+  grpcurl -plaintext -d '{"id": "<id>"}' localhost:50051 doctor.DoctorService/GetDoctor 2>&1 | tail -1
+done
+```
+
+**Expected error after limit:**
+```
+Code: ResourceExhausted
+Message: rate limit exceeded: 100 requests per minute allowed; retry after 60 seconds
+```
+
+---
+
+### Checkpoint 3 — Job Queue & Gateway
+
+```bash
+# Create doctor
 grpcurl -plaintext -d '{
-  "title": "Initial cardiac consultation",
-  "description": "First visit",
-  "doctor_id": "<doctor_id_from_above>"
+  "full_name": "Dr. Smith",
+  "specialization": "Neurology",
+  "email": "smith@clinic.kz"
+}' localhost:50051 doctor.DoctorService/CreateDoctor
+
+# Create appointment
+grpcurl -plaintext -d '{
+  "title": "Checkup",
+  "description": "Routine checkup",
+  "doctor_id": "<doctor_id>"
 }' localhost:50052 appointment.AppointmentService/CreateAppointment
-```
 
-**Expected Notification Service stdout:**
-```json
-{"time":"<RFC3339>","subject":"appointments.created","event":{"doctor_id":"<id>","event_type":"appointments.created","id":"<uuid>","occurred_at":"<RFC3339>","status":"new","title":"Initial cardiac consultation"}}
-```
-
----
-
-### Update Appointment Status
-
-```bash
+# Trigger job — update status to done
 grpcurl -plaintext -d '{
   "id": "<appointment_id>",
-  "status": "in_progress"
+  "status": "done"
 }' localhost:50052 appointment.AppointmentService/UpdateAppointmentStatus
 ```
 
-**Expected Notification Service stdout:**
+**Notification Service terminal:**
 ```json
-{"time":"<RFC3339>","subject":"appointments.status_updated","event":{"event_type":"appointments.status_updated","id":"<id>","new_status":"in_progress","occurred_at":"<RFC3339>","old_status":"new"}}
+{"time":"...","level":"info","msg":"event received","data":{"subject":"appointments.status_updated"}}
+{"time":"...","level":"info","job_id":"idempotency:abc...","status":"enqueued"}
+{"time":"...","level":"info","job_id":"idempotency:abc...","attempt":1,"status":"processing"}
+{"time":"...","level":"info","job_id":"idempotency:abc...","attempt":1,"status":"success"}
+```
+
+**Mock Gateway terminal:**
+```json
+{"time":"...","result":"accepted","idempotency_key":"idempotency:abc...","status_code":200}
 ```
 
 ---
 
-### Other Commands (unchanged from Assignment 2)
+### Checkpoint 4 — Idempotency
+
+Replay the same event manually via NATS CLI after a successful Checkpoint 3:
 
 ```bash
-# Get doctor by ID
-grpcurl -plaintext -d '{"id": "<id>"}' localhost:50051 doctor.DoctorService/GetDoctor
-
-# List all doctors
-grpcurl -plaintext -d '{}' localhost:50051 doctor.DoctorService/ListDoctors
-
-# Get appointment by ID
-grpcurl -plaintext -d '{"id": "<id>"}' localhost:50052 appointment.AppointmentService/GetAppointment
-
-# List all appointments
-grpcurl -plaintext -d '{}' localhost:50052 appointment.AppointmentService/ListAppointments
+nats pub appointments.status_updated '{
+  "event_type":"appointments.status_updated",
+  "occurred_at":"<SAME_TIMESTAMP>",
+  "id":"<SAME_APPOINTMENT_ID>",
+  "old_status":"scheduled",
+  "new_status":"done",
+  "doctor_id":"<SAME_DOCTOR_ID>"
+}'
 ```
+
+**Notification Service terminal:**
+```json
+{"time":"...","level":"info","msg":"event received"}
+{"time":"...","level":"info","msg":"duplicate job dropped (already processed)","data":{"job_id":"idempotency:abc..."}}
+```
+
+No second POST to the gateway.
 
 ---
 
-## 12. Consistency Trade-offs
+### Checkpoint 5 — Dead Letter
 
-### What happens when the broker is unavailable
+```bash
+# Stop the Mock Gateway (Ctrl+C in its terminal)
+# Then trigger another UpdateAppointmentStatus to done (new appointment)
+```
 
-- **Doctor / Appointment Services:** If NATS is down at startup, the service logs a warning and continues with a `NoopPublisher`. All RPCs succeed normally; events are simply not published.
-- **Notification Service:** Retries with exponential backoff; exits with non-zero code if NATS is unreachable after all retries.
-- **Mid-RPC broker failure:** If NATS becomes unavailable during an RPC, the publish call returns an error that is logged with full context. The gRPC response is returned successfully — broker publishing never blocks the RPC response.
+**Notification Service terminal:**
+```json
+{"time":"...","level":"info","job_id":"...","attempt":1,"status":"processing"}
+{"time":"...","level":"warn","job_id":"...","attempt":1,"status":"retry","error":"service unavailable"}
+{"time":"...","level":"info","job_id":"...","attempt":2,"status":"processing"}
+{"time":"...","level":"warn","job_id":"...","attempt":2,"status":"retry","error":"service unavailable"}
+{"time":"...","level":"info","job_id":"...","attempt":3,"status":"processing"}
+{"time":"...","level":"warn","job_id":"...","attempt":3,"status":"retry","error":"service unavailable"}
+```
 
-### Which events can be lost
+**stderr:**
+```json
+{"time":"...","level":"error","job_id":"...","attempt":3,"status":"dead_letter","error":"service unavailable"}
+```
 
-Because publishing is best-effort (fire-and-forget), a process crash between the DB `COMMIT` and the `Publish()` call will silently drop the event. The database will have the new row, but the Notification Service will never see it.
-
-### How durable delivery would improve reliability
-
-| Approach | Mechanism | Guarantee |
-|---|---|---|
-| **Outbox Pattern** | Write the event to an `outbox` table inside the same DB transaction, then have a background worker relay it to the broker | Atomic DB commit guarantees the event is never lost; at-least-once delivery |
-| **NATS JetStream** | Persistent subjects with consumer acknowledgement and replay | Broker-side durability + re-delivery on failure |
-| **RabbitMQ publisher confirms** | Broker ACKs each message after writing to durable queue | Ensures the broker received and persisted the message before the publisher proceeds |
+Service continues running normally after dead-letter.
 
 ---
 
-## 13. Project Structure
+## 13. Event Contract
+
+| Subject | Publisher | Trigger | JSON Fields |
+|---|---|---|---|
+| `doctors.created` | Doctor Service | `CreateDoctor` succeeds | `event_type`, `occurred_at`, `id`, `full_name`, `specialization`, `email` |
+| `appointments.created` | Appointment Service | `CreateAppointment` succeeds | `event_type`, `occurred_at`, `id`, `title`, `doctor_id`, `status` |
+| `appointments.status_updated` | Appointment Service | `UpdateAppointmentStatus` succeeds | `event_type`, `occurred_at`, `id`, `old_status`, `new_status`, `doctor_id` |
+
+Job queue is triggered **only** by `appointments.status_updated` where `new_status = "done"`.
+
+---
+
+## 14. Project Structure
 
 ```
-ap2-assignment3/
+ap2-assignment4/
 ├── doctor-service/
 │   ├── cmd/doctor-service/main.go
 │   ├── internal/
 │   │   ├── model/doctor.go
 │   │   ├── repository/
-│   │   │   ├── doctor_repository.go          ← interface
-│   │   │   └── postgres_doctor_repository.go ← PostgreSQL impl
-│   │   ├── usecase/doctor_usecase.go
-│   │   ├── event/publisher.go                ← EventPublisher interface + NATS impl
+│   │   │   ├── doctor_repository.go
+│   │   │   └── postgres_doctor_repository.go
+│   │   ├── usecase/doctor_usecase.go        ← Cache-Aside reads, Write-Through writes
+│   │   ├── cache/
+│   │   │   ├── repository.go               ← CacheRepository interface
+│   │   │   └── redis_cache.go              ← Redis implementation
+│   │   ├── middleware/
+│   │   │   └── rate_limiter.go             ← gRPC UnaryServerInterceptor
+│   │   ├── event/publisher.go
 │   │   ├── transport/grpc/handler.go
 │   │   └── app/app.go
 │   ├── migrations/
 │   │   ├── 000001_create_doctors.up.sql
 │   │   └── 000001_create_doctors.down.sql
 │   ├── proto/
-│   │   ├── doctor.proto
-│   │   ├── doctor.pb.go
-│   │   └── doctor_grpc.pb.go
 │   └── go.mod
 ├── appointment-service/
 │   ├── cmd/appointment-service/main.go
 │   ├── internal/
 │   │   ├── model/appointment.go
 │   │   ├── repository/
-│   │   │   ├── appointment_repository.go          ← interface
-│   │   │   └── postgres_appointment_repository.go ← PostgreSQL impl
-│   │   ├── usecase/appointment_usecase.go
+│   │   ├── usecase/appointment_usecase.go   ← Write-Around create, Write-Through update
+│   │   ├── cache/
+│   │   │   ├── repository.go
+│   │   │   └── redis_cache.go
+│   │   ├── middleware/
+│   │   │   └── rate_limiter.go
 │   │   ├── event/publisher.go
 │   │   ├── client/
-│   │   │   ├── doctor_client.go     ← interface
-│   │   │   └── grpc_doctor_client.go
 │   │   ├── transport/grpc/handler.go
 │   │   └── app/app.go
 │   ├── migrations/
-│   │   ├── 000001_create_appointments.up.sql
-│   │   └── 000001_create_appointments.down.sql
 │   ├── proto/
 │   └── go.mod
 ├── notification-service/
 │   ├── cmd/notification-service/main.go
-│   ├── internal/subscriber/subscriber.go
+│   ├── internal/
+│   │   └── subscriber/
+│   │       ├── subscriber.go               ← NATS subscriber
+│   │       ├── logger/logger.go            ← structured JSON logger
+│   │       ├── jobqueue/
+│   │       │   ├── job.go                  ← Job struct + Notifier interface
+│   │       │   ├── worker_pool.go          ← goroutine pool + retry + dead-letter
+│   │       │   └── idempotency.go          ← SHA-256 key + CacheRepository interface
+│   │       └── gateway/gateway.go          ← HTTP client for Mock Gateway
 │   └── go.mod
-├── setup.sh
+├── mock-gateway/
+│   ├── cmd/main.go                         ← POST /notify, 20% 503, idempotency map
+│   └── go.mod
+├── docker-compose.yml
 └── README.md
 ```
