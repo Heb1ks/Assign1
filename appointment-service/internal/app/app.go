@@ -1,8 +1,10 @@
 package app
 
 import (
+	"appointment-service/internal/cache"
 	"appointment-service/internal/client"
 	"appointment-service/internal/event"
+	"appointment-service/internal/middleware"
 	"appointment-service/internal/repository"
 	grpchandler "appointment-service/internal/transport/grpc"
 	"appointment-service/internal/usecase"
@@ -13,6 +15,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 
 	"github.com/golang-migrate/migrate/v4"
@@ -23,7 +26,7 @@ import (
 )
 
 func Run(addr string) error {
-	// db
+	// ── База данных ──────────────────────────────────────────────────────────
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
 		dsn = "postgres://postgres:postgres@localhost:5432/appointments?sslmode=disable"
@@ -37,12 +40,11 @@ func Run(addr string) error {
 	}
 	log.Println("Appointment Service: database connected")
 
-	//  migration
 	if err := runMigrations(db); err != nil {
 		return fmt.Errorf("migrate: %w", err)
 	}
 
-	//  nats (best-effort)
+	// ── NATS (best-effort) ───────────────────────────────────────────────────
 	natsURL := os.Getenv("NATS_URL")
 	if natsURL == "" {
 		natsURL = "nats://localhost:4222"
@@ -50,14 +52,38 @@ func Run(addr string) error {
 	var pub event.EventPublisher
 	natsPub, err := event.NewNATSPublisher(natsURL)
 	if err != nil {
-		log.Printf("WARN: cannot connect to NATS (%v); using NoopPublisher", err)
+		log.Printf("[WARN] NATS unavailable (%v); using NoopPublisher", err)
 		pub = event.NoopPublisher{}
 	} else {
 		log.Println("Appointment Service: NATS connected")
 		pub = natsPub
 	}
 
-	//  Doctor Service grpc client
+	// ── Redis Cache ──────────────────────────────────────────────────────────
+	redisURL := os.Getenv("REDIS_URL")
+	if redisURL == "" {
+		redisURL = "redis://localhost:6379"
+	}
+	ttl := 60
+	if v := os.Getenv("CACHE_TTL_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			ttl = n
+		}
+	}
+	cacheRepo := cache.NewRedisCacheRepository(redisURL, ttl)
+	defer cacheRepo.Close()
+
+	// ── Rate Limiter ─────────────────────────────────────────────────────────
+	rpmLimit := 100
+	if v := os.Getenv("RATE_LIMIT_RPM"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			rpmLimit = n
+		}
+	}
+	rateLimiter := middleware.NewRateLimiter(redisURL, rpmLimit)
+	defer rateLimiter.Close()
+
+	// ── Doctor Service gRPC клиент ────────────────────────────────────────────
 	doctorAddr := os.Getenv("DOCTOR_SERVICE_ADDR")
 	if doctorAddr == "" {
 		doctorAddr = "localhost:50051"
@@ -67,17 +93,19 @@ func Run(addr string) error {
 		return fmt.Errorf("doctor client: %w", err)
 	}
 
-	// dependecis
+	// ── Зависимости ──────────────────────────────────────────────────────────
 	repo := repository.NewPostgresAppointmentRepository(db)
-	uc := usecase.NewAppointmentUseCase(repo, dc, pub)
+	uc := usecase.NewAppointmentUseCase(repo, dc, pub, cacheRepo) // ← кэш
 	srv := grpchandler.NewAppointmentServer(uc)
 
-	// grpc server
+	// ── gRPC сервер ──────────────────────────────────────────────────────────
 	lis, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", addr, err)
 	}
-	grpcSrv := grpc.NewServer()
+	grpcSrv := grpc.NewServer(
+		grpc.UnaryInterceptor(rateLimiter.UnaryServerInterceptor),
+	)
 	pb.RegisterAppointmentServiceServer(grpcSrv, srv)
 
 	quit := make(chan os.Signal, 1)

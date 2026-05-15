@@ -30,6 +30,7 @@ type AppointmentStatusUpdatedEvent struct {
 	ID         string `json:"id"`
 	OldStatus  string `json:"old_status"`
 	NewStatus  string `json:"new_status"`
+	DoctorID   string `json:"doctor_id"`
 }
 
 type NATSPublisher struct {
@@ -81,10 +82,10 @@ func NewAppointmentCreatedEvent(id, title, doctorID, status string) AppointmentC
 	}
 }
 
-func NewAppointmentStatusUpdatedEvent(id, oldStatus, newStatus string) AppointmentStatusUpdatedEvent {
+func NewAppointmentStatusUpdatedEvent(id, oldStatus, newStatus, doctorID string) AppointmentStatusUpdatedEvent {
 	return AppointmentStatusUpdatedEvent{
 		EventType:  "appointments.status_updated",
 		OccurredAt: time.Now().UTC().Format(time.RFC3339),
-		ID:         id, OldStatus: oldStatus, NewStatus: newStatus,
+		ID:         id, OldStatus: oldStatus, NewStatus: newStatus, DoctorID: doctorID,
 	}
 }
