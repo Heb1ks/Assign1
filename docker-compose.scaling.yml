@@ -1,0 +1,189 @@
+version: '3.8'
+
+
+services:
+
+  # ── Infrastructure (single-instance — not scaled) ──────────────────────────
+  postgres:
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          cpus:   '1.0'
+          memory: 512M
+        reservations:
+          cpus:   '0.25'
+          memory: 128M
+      restart_policy:
+        condition: on-failure
+        max_attempts: 3
+
+  redis:
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          cpus:   '0.5'
+          memory: 128M
+        reservations:
+          cpus:   '0.1'
+          memory: 32M
+      restart_policy:
+        condition: on-failure
+        max_attempts: 3
+
+  nats:
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          cpus:   '0.5'
+          memory: 64M
+        reservations:
+          cpus:   '0.1'
+          memory: 16M
+      restart_policy:
+        condition: on-failure
+        max_attempts: 3
+
+  # ── Application services (scalable) ────────────────────────────────────────
+  doctor-service:
+    build: ./doctor-service
+    environment:
+      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/doctors?sslmode=disable"
+      REDIS_URL: "redis://redis:6379"
+      NATS_URL: "nats://nats:4222"
+      GRPC_PORT: "50051"
+      RATE_LIMIT_RPM: "100"
+      CACHE_TTL_SECONDS: "60"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    # No fixed port mapping — use internal DNS for service discovery.
+    # The mock-gateway / appointment-service talks to doctor-service:50051
+    expose:
+      - "50051"
+    networks:
+      - default
+    deploy:
+      replicas: 1            # autoscale.sh will raise/lower this
+      resources:
+        limits:
+          cpus:   '0.5'      # cap per container
+          memory: 128M
+        reservations:
+          cpus:   '0.1'
+          memory: 32M
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 5
+      # Rolling update — replace one container at a time during re-deploys
+      update_config:
+        parallelism: 1
+        delay: 5s
+        order: start-first   # new container starts before old one stops
+
+  appointment-service:
+    build:
+      context: .
+      dockerfile: appointment-service/Dockerfile
+    environment:
+      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/appointments?sslmode=disable"
+      REDIS_URL: "redis://redis:6379"
+      NATS_URL: "nats://nats:4222"
+      DOCTOR_SERVICE_ADDR: "doctor-service:50051"
+      GRPC_PORT: "50052"
+      RATE_LIMIT_RPM: "100"
+      CACHE_TTL_SECONDS: "60"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    expose:
+      - "50052"
+    networks:
+      - default
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          cpus:   '0.5'
+          memory: 128M
+        reservations:
+          cpus:   '0.1'
+          memory: 32M
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 5
+      update_config:
+        parallelism: 1
+        delay: 5s
+        order: start-first
+
+  notification-service:
+    build: ./notification-service
+    environment:
+      NATS_URL: "nats://nats:4222"
+      GATEWAY_URL: "http://mock-gateway:8080/notify"
+      WORKER_POOL_SIZE: "5"
+      JOB_RETRY_MAX: "3"
+    depends_on:
+      nats:
+        condition: service_healthy
+    networks:
+      - default
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          cpus:   '0.25'
+          memory: 64M
+        reservations:
+          cpus:   '0.05'
+          memory: 16M
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 5
+      update_config:
+        parallelism: 1
+        delay: 5s
+        order: start-first
+
+  mock-gateway:
+    build: ./mock-gateway
+    environment:
+      GATEWAY_PORT: "8080"
+    ports:
+      - "8080:8080"   # exposed — load tester hits this
+    networks:
+      - default
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          cpus:   '1'
+          memory: 256M
+        reservations:
+          cpus:   '0.05'
+          memory: 16M
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 5
+      update_config:
+        parallelism: 1
+        delay: 5s
+        order: start-first
+
+volumes:
+  pg_data:
