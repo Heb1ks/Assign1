@@ -1,0 +1,11 @@
+groups:
+  - name: sre-alerts
+    rules:
+      - alert: TargetDown
+        expr: up == 0
+        for: 10s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Target is down"
+          description: "Prometheus target is unreachable"
