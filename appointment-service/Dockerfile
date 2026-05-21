@@ -12,4 +12,5 @@ RUN go build -o service ./cmd/appointment-service
 
 FROM alpine:latest
 COPY --from=builder /app/appointment-service/service .
+COPY --from=builder /app/appointment-service/migrations ./migrations  
 ENTRYPOINT ["./service"]

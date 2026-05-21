@@ -1,0 +1,40 @@
+[2026-05-21 00:36:59] [INFO ] Auto-scaler started.
+[2026-05-21 00:36:59] [INFO ] Services: doctor-service appointment-service notification-service mock-gateway
+[2026-05-21 00:36:59] [INFO ] Thresholds: up=70% (2 polls), down=20% (5 polls)
+[2026-05-21 00:36:59] [INFO ] Replicas: min=1 max=5 | cooldown=30s | poll=10s
+
+[2026-05-21 00:37:04] [INFO ]   doctor-service: CPU=0%  replicas=1  up_streak=0  down_streak=0
+[2026-05-21 00:37:06] [INFO ]   appointment-service: CPU=0%  replicas=1  up_streak=0  down_streak=0
+[2026-05-21 00:37:09] [INFO ]   notification-service: CPU=0%  replicas=1  up_streak=0  down_streak=0
+[2026-05-21 00:37:12] [INFO ]   mock-gateway: CPU=0%  replicas=1  up_streak=0  down_streak=0
+[2026-05-21 00:37:23] [INFO ]   doctor-service: CPU=0%  replicas=1  up_streak=0  down_streak=1
+[2026-05-21 00:37:25] [INFO ]   appointment-service: CPU=0%  replicas=1  up_streak=0  down_streak=1
+[2026-05-21 00:37:30] [INFO ]   notification-service: CPU=0%  replicas=1  up_streak=0  down_streak=1
+[2026-05-21 00:37:32] [INFO ]   mock-gateway: CPU=0%  replicas=1  up_streak=0  down_streak=1
+[2026-05-21 00:37:45] [INFO ]   doctor-service: CPU=0%  replicas=1  up_streak=0  down_streak=2
+[2026-05-21 00:37:47] [INFO ]   appointment-service: CPU=0%  replicas=1  up_streak=0  down_streak=2
+[2026-05-21 00:37:48] [INFO ]   notification-service: CPU=0%  replicas=1  up_streak=0  down_streak=2
+[2026-05-21 00:37:50] [INFO ]   mock-gateway: CPU=0%  replicas=1  up_streak=0  down_streak=2
+[2026-05-21 00:38:02] [INFO ]   doctor-service: CPU=0%  replicas=1  up_streak=0  down_streak=3
+[2026-05-21 00:38:04] [INFO ]   appointment-service: CPU=0%  replicas=1  up_streak=0  down_streak=3
+[2026-05-21 00:38:10] [INFO ]   notification-service: CPU=0%  replicas=1  up_streak=0  down_streak=3
+[2026-05-21 00:38:12] [INFO ]   mock-gateway: CPU=0%  replicas=1  up_streak=0  down_streak=3
+[2026-05-21 00:38:23] [INFO ]   doctor-service: CPU=0%  replicas=1  up_streak=0  down_streak=4
+[2026-05-21 00:38:25] [INFO ]   appointment-service: CPU=0%  replicas=1  up_streak=0  down_streak=4
+[2026-05-21 00:38:29] [INFO ]   notification-service: CPU=0%  replicas=1  up_streak=0  down_streak=4
+[2026-05-21 00:38:29] [INFO ]   mock-gateway: CPU=0%  replicas=1  up_streak=0  down_streak=4
+[2026-05-21 00:38:41] [INFO ]   doctor-service: CPU=0%  replicas=1  up_streak=0  down_streak=0
+[2026-05-21 00:38:45] [INFO ]   appointment-service: CPU=0%  replicas=1  up_streak=0  down_streak=0
+[2026-05-21 00:38:47] [INFO ]   notification-service: CPU=0%  replicas=1  up_streak=0  down_streak=0
+[2026-05-21 00:38:49] [INFO ]   mock-gateway: CPU=0%  replicas=1  up_streak=0  down_streak=0
+[2026-05-21 00:39:01] [INFO ]   doctor-service: CPU=0%  replicas=1  up_streak=0  down_streak=1
+[2026-05-21 00:39:03] [INFO ]   appointment-service: CPU=0%  replicas=1  up_streak=0  down_streak=1
+[2026-05-21 00:39:07] [INFO ]   notification-service: CPU=0%  replicas=1  up_streak=0  down_streak=1
+[2026-05-21 00:39:09] [INFO ]   mock-gateway: CPU=0%  replicas=1  up_streak=0  down_streak=1
+[2026-05-21 00:39:11] [INFO ] Auto-scaler started.
+[2026-05-21 00:39:11] [INFO ] Services: doctor-service appointment-service notification-service mock-gateway
+[2026-05-21 00:39:11] [INFO ] Thresholds: up=60% (2 polls), down=15% (5 polls)
+[2026-05-21 00:39:11] [INFO ] Replicas: min=2 max=4 | cooldown=20s | poll=5s
+
+[2026-05-21 00:39:14] [INFO ]   doctor-service: CPU=0%  replicas=1  up_streak=0  down_streak=0
+[2026-05-21 00:39:16] [INFO ]   appointment-service: CPU=0%  replicas=1  up_streak=0  down_streak=0
